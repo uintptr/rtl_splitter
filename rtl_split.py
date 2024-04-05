@@ -3,13 +3,33 @@
 import sys
 import argparse
 import asyncio
+import enum
+import struct
 
 from asyncio import StreamReader, StreamWriter
 
 from typing import Self
 
 RTL_HEADER_SIZE = 12  # see struct rtl_tcp_info (sdr.c)
-RTL_COMMAND_SIZE = 5 # see struct command (sdr.c)
+RTL_COMMAND_SIZE = 5  # see struct command (sdr.c)
+
+
+class RTLCommand(enum.Enum):
+    RTLTCP_SET_FREQ = 0x01
+    RTLTCP_SET_SAMPLE_RATE = 0x02
+    RTLTCP_SET_GAIN_MODE = 0x03
+    RTLTCP_SET_GAIN = 0x04
+    RTLTCP_SET_FREQ_CORRECTION = 0x05
+    RTLTCP_SET_IF_TUNER_GAIN = 0x06
+    RTLTCP_SET_TEST_MODE = 0x07
+    RTLTCP_SET_AGC_MODE = 0x08
+    RTLTCP_SET_DIRECT_SAMPLING = 0x09
+    RTLTCP_SET_OFFSET_TUNING = 0x0a
+    RTLTCP_SET_RTL_XTAL = 0x0b
+    RTLTCP_SET_TUNER_XTAL = 0x0c
+    RTLTCP_SET_TUNER_GAIN_BY_ID = 0x0d
+    RTLTCP_SET_BIAS_TEE = 0x0e
+
 
 class RTLSplitter:
     def __init__(self, host: str, port: int) -> None:
@@ -23,7 +43,7 @@ class RTLSplitter:
 
     async def __aenter__(self) -> Self:
 
-        r,w = await asyncio.open_connection(self.host, self.port)
+        r, w = await asyncio.open_connection(self.host, self.port)
         self.reader = r
         self.writer = w
 
@@ -31,14 +51,27 @@ class RTLSplitter:
 
         return self
 
-    async def __aexit__(self, exc_type, exc_value, traceback) -> None: # type: ignore
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:  # type: ignore
 
         self.writer.close()
         await self.writer.wait_closed()
 
-    async def __rtl_proxy(self) -> None:
+    async def send_command(self, cmd: bytes) -> None:
+        self.writer.write(cmd)
+        await self.writer.drain()
 
-        while(True):
+    def add_client(self, writer: StreamWriter) -> None:
+        self.client_writers.append(writer)
+
+    def rem_client(self, writer: StreamWriter) -> None:
+
+        if writer in self.client_writers:
+            self.client_writers.remove(writer)
+
+    async def splitter(self) -> None:
+
+        # read from rtl_tcp and forward data if any
+        while (True):
 
             data = await self.reader.read(1024)
 
@@ -56,20 +89,6 @@ class RTLSplitter:
                     if c in self.client_writers:
                         self.client_writers.remove(c)
 
-    async def send_command(self, cmd: bytes) -> None:
-        self.writer.write(cmd)
-        await self.writer.drain()
-
-    def add_client(self, writer: StreamWriter) -> None:
-        self.client_writers.append(writer)
-
-    def rem_client(self, writer: StreamWriter) -> None:
-
-        if writer in self.client_writers:
-            self.client_writers.remove(writer)
-
-    async def splitter(self) -> None:
-        await self.__rtl_proxy()
 
 class RTLClient:
 
@@ -78,27 +97,36 @@ class RTLClient:
 
     async def callback(self, reader: StreamReader, writer: StreamWriter) -> None:
 
+        print("-" * 60)
         self.rtl.add_client(writer)
 
         try:
-            writer.write(self.rtl.header)
-            await writer.drain()
+            try:
+                writer.write(self.rtl.header)
+                await writer.drain()
 
-            while(True):
-                data = await reader.read(5)
+                while (True):
+                    data = await reader.read(5)
 
-                if b'' == data:
-                    break
+                    if b'' == data:
+                        break
 
-                print("command", data.hex())
+                    c, v = struct.unpack(">BI", data)
 
-                await self.rtl.send_command(data)
+                    cmd = RTLCommand(c)
+
+                    print(f"{cmd.name:<27} -> {v}")
+
+                    await self.rtl.send_command(data)
+            finally:
+                self.rtl.rem_client(writer)
+                writer.close()
+                await writer.wait_closed()
         except asyncio.exceptions.CancelledError:
             pass
-        finally:
-            self.rtl.rem_client(writer)
-            writer.close()
-            await writer.wait_closed()
+        except ConnectionResetError:
+            pass
+
 
 async def server_loop(rtl: RTLSplitter, port: int) -> None:
 
@@ -108,6 +136,7 @@ async def server_loop(rtl: RTLSplitter, port: int) -> None:
 
     async with server:
         await server.serve_forever()
+
 
 async def main() -> int:
 
@@ -139,24 +168,22 @@ async def main() -> int:
 
     args = parser.parse_args()
 
-    try:
+    async with RTLSplitter(args.target, args.port) as rtl:
 
-        async with RTLSplitter(args.target, args.port) as rtl:
-
-            await asyncio.gather(
-                server_loop(rtl, args.listen),
-                rtl.splitter()
-            )
-
-    except KeyboardInterrupt:
-        status = 0
+        await asyncio.gather(
+            server_loop(rtl, args.listen),
+            rtl.splitter()
+        )
 
     return status
 
 
 if __name__ == '__main__':
 
-    status = asyncio.run(main())
+    try:
+        status = asyncio.run(main())
+    except KeyboardInterrupt:
+        status = 0
 
     if 0 != status:
         sys.exit(status)
